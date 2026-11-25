@@ -63,7 +63,19 @@
 </section>
 
 <section>
-  <h2>4. 下载（同一快照，读盘可继续）</h2>
+  <h2>4. 核对已救扇区</h2>
+  <p class="muted">用建任务时上传的样盘逐个核对「核对开始时已救出」的扇区，
+    把读足 512 字节但内容读错的扇区退回缺失。核对期间上报补读照常进行；
+    样盘读不全或核对期间换了任务，本轮作废、进度保持原样。</p>
+  <div class="row">
+    <button id="verify-btn">用样盘核对</button>
+    <span id="verify-result" class="muted"></span>
+  </div>
+  <pre id="verify-detail" hidden></pre>
+</section>
+
+<section>
+  <h2>5. 下载（同一快照，读盘可继续）</h2>
   <div class="row">
     <button id="snapshot-btn">生成进度快照</button>
     <span id="snapshot-info" class="muted"></span>
@@ -134,6 +146,44 @@ $('report-btn').addEventListener('click', async () => {
   refresh();
 });
 
+$('verify-btn').addEventListener('click', async () => {
+  const btn = $('verify-btn');
+  btn.disabled = true;
+  $('verify-result').textContent = '核对中…（补读可继续）';
+  $('verify-detail').hidden = true;
+  try {
+    const r = await fetch('/api/verify', { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok) {
+      $('verify-result').textContent = '核对作废：' + j.error;
+      return;
+    }
+    const retracted = j.retracted || [];
+    $('verify-result').textContent =
+      `核对 ${j.checked} 个已救扇区，发现内容不符 ${j.mismatched.length} 个，` +
+      `退回缺失 ${retracted.length} 个` +
+      (retracted.length ? `：${retracted.join(', ')}` : '') +
+      (j.kept_changed && j.kept_changed.length
+        ? `；保留（当前字节已变）${j.kept_changed.join(', ')}`
+        : '');
+    $('verify-detail').hidden = false;
+    $('verify-detail').textContent = JSON.stringify(
+      {
+        retracted,
+        kept_changed: j.kept_changed || [],
+        mismatched: j.mismatched || [],
+        missing_count: j.missing_count,
+      },
+      null, 2
+    );
+    refresh();
+  } catch (e) {
+    $('verify-result').textContent = '核对请求失败：' + e;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 $('snapshot-btn').addEventListener('click', async () => {
   const r = await fetch('/api/snapshots', { method: 'POST' });
   const j = await r.json();
@@ -156,6 +206,8 @@ $('reset-btn').addEventListener('click', async () => {
   $('snapshot-links').innerHTML = '';
   $('missing-preview').hidden = true;
   $('snapshot-info').textContent = '';
+  $('verify-result').textContent = '';
+  $('verify-detail').hidden = true;
   refresh();
 });
 </script>

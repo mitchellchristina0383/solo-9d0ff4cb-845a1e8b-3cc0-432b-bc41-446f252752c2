@@ -138,6 +138,15 @@ def report_sectors(client: Client, image: bytes, indexes) -> None:
         client.post_json("/api/sectors", {"sectors": entries[start : start + 25]})
 
 
+def report_raw_bytes(client: Client, pairs) -> None:
+    """pairs: [(index, 512 字节)]，用于上报「长度够但内容错」的扇区。"""
+    entries = [
+        {"sector": i, "data": base64.b64encode(data).decode()} for i, data in pairs
+    ]
+    for start in range(0, len(entries), 25):
+        client.post_json("/api/sectors", {"sectors": entries[start : start + 25]})
+
+
 def check(cond: bool, message: str) -> None:
     if not cond:
         raise AssertionError("校验失败：" + message)
@@ -272,6 +281,122 @@ def main() -> int:
         check(snap2["missing"] == [], "新快照反映最新进度：无缺失")
         _, img2 = client.get_bytes(f"/api/snapshots/{snap2['snapshot_id']}/image.bin")
         check(img2 == image, "新快照镜像与样盘逐字节一致")
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
+
+    # ================= 场景 C：核对与补读交错 + 重启 + 快照 =================
+    print("\n== 场景 C：样盘核对、退回缺失、补读交错、快照与重启 ==")
+    work_c = tempfile.mkdtemp(prefix="rescue-e2e-c-")
+    port = base_port + 2
+    sectors_c = 30
+    proc = start_server(work_c, port)
+    try:
+        client = Client(f"http://127.0.0.1:{port}")
+        client.upload(image[: sectors_c * 512])
+
+        # 第 1 轮：多数扇区正确救出；12、18 上报了长度够但内容错的字节；
+        # 5、21 读失败不上报；一个真实全零扇区 2 正常保存。
+        wrong = {
+            12: b"\xab" * 512,
+            18: bytes(reversed(image[18 * 512 : 19 * 512])),
+        }
+        good = [
+            i
+            for i in range(sectors_c)
+            if i not in wrong and i not in (5, 21)
+        ]
+        report_sectors(client, image, good)
+        report_raw_bytes(client, list(wrong.items()))
+        state = client.get_json("/api/job")["progress"]
+        check(state["missing"] == [5, 21], "第 1 轮后只有真正读失败的 5、21 缺失")
+        check(state["saved_count"] == sectors_c - 2, "读足字节的错扇区暂算已救")
+
+        # 核对前先生成一份旧快照：之后即使核对退回，它仍保留原字节与旧缺失清单
+        sid_old = client.post_json("/api/snapshots", {})["snapshot"]["snapshot_id"]
+        old_img = client.get_bytes(f"/api/snapshots/{sid_old}/image.bin")[1]
+        old_missing = client.get_json(f"/api/snapshots/{sid_old}/missing.json")["missing"]
+        check(old_missing == [5, 21], "旧快照缺失清单 = 核对前进度")
+        check(old_img[12 * 512 : 13 * 512] == wrong[12],
+              "旧快照保留 12 号扇区的原始（错误）字节")
+
+        # 核对与补读交错：核对请求发出后，立即补读 5 号；两者都应收敛
+        import threading
+
+        verify_out = {}
+
+        def run_verify():
+            verify_out.update(client.post_json("/api/verify", {}))
+
+        verifier = threading.Thread(target=run_verify)
+        verifier.start()
+        # 核对进行中照常补读：5 号被救出（内容正确），21 号本轮仍失败
+        report_sectors(client, image, [5])
+        verifier.join(60)
+        check(not verifier.is_alive(), "核对线程结束")
+
+        retracted = verify_out.get("retracted", [])
+        check(sorted(verify_out.get("mismatched", [])) == [12, 18],
+              "核对发现 12、18 内容不符")
+        check(retracted == [12, 18], "12、18 被退回缺失并列出")
+        state = client.get_json("/api/job")["progress"]
+        check(12 in state["missing"] and 18 in state["missing"],
+              "退回的 12、18 在进度中算缺失")
+        check(5 not in state["missing"], "核对期间补读的 5 保留，未被误退")
+        check(client.get_json("/api/missing")["missing"] == [12, 18, 21],
+              "最终缺失清单恰为 12、18、21")
+
+        # 旧快照仍可下载且内容不变
+        check(client.get_bytes(f"/api/snapshots/{sid_old}/image.bin")[1] == old_img,
+              "核对退回后旧快照镜像逐字节不变")
+        check(client.get_json(f"/api/snapshots/{sid_old}/missing.json")["missing"]
+              == old_missing, "核对退回后旧快照缺失清单不变")
+
+        # 重启后：退回的 12、18 仍算缺失；旧快照仍可下载
+        proc.terminate()
+        proc.wait(timeout=10)
+        proc = start_server(work_c, port)
+        client = Client(f"http://127.0.0.1:{port}")
+        state = client.get_json("/api/job")["progress"]
+        check(state["missing"] == [12, 18, 21], "重启后退回的 12、18 仍算缺失")
+        check(client.get_bytes(f"/api/snapshots/{sid_old}/image.bin")[1] == old_img,
+              "重启后旧快照仍可下载原字节")
+        check(client.get_json(f"/api/snapshots/{sid_old}/missing.json")["missing"]
+              == old_missing, "重启后旧快照缺失清单仍可下载")
+
+        # 新快照按更新后的进度生成：12、18、21 缺失补零
+        sid_new = client.post_json("/api/snapshots", {})["snapshot"]["snapshot_id"]
+        new_missing = client.get_json(f"/api/snapshots/{sid_new}/missing.json")["missing"]
+        new_img = client.get_bytes(f"/api/snapshots/{sid_new}/image.bin")[1]
+        check(new_missing == [12, 18, 21], "新快照缺失 = 更新后进度")
+        check(all(new_img[i * 512 : (i + 1) * 512] == b"\x00" * 512 for i in (12, 18, 21)),
+              "新快照对退回扇区补零")
+
+        # 补读交错收尾：把 12、18、21 全部补读回来，再核对应无退回
+        report_sectors(client, image, [12, 18, 21])
+        final_verify = client.post_json("/api/verify", {})
+        check(final_verify["retracted"] == [], "补读后核对不再退回任何扇区")
+        state = client.get_json("/api/job")["progress"]
+        check(state["saved_count"] == sectors_c and state["complete"] is True,
+              "补读完成后任务完整")
+        sid_final = client.post_json("/api/snapshots", {})["snapshot"]["snapshot_id"]
+        _, final_img = client.get_bytes(f"/api/snapshots/{sid_final}/image.bin")
+        check(final_img == image[: sectors_c * 512], "最终快照与样盘逐字节一致")
+
+        # 样盘读不全：截断样盘后核对应报错且不改动进度
+        sample_path = os.path.join(work_c, "sample.img")
+        before = client.get_json("/api/job")["progress"]
+        with open(sample_path, "rb") as fh:
+            full = fh.read()
+        with open(sample_path, "wb") as fh:
+            fh.write(full[:-512])
+        try:
+            client.post_json("/api/verify", {})
+            check(False, "截断样盘后核对应报错")
+        except urllib.error.HTTPError as exc:
+            check(exc.code == 422, "样盘读不全返回 422")
+        after = client.get_json("/api/job")["progress"]
+        check(before["saved"] == after["saved"], "样盘读不全时进度保持原样")
     finally:
         proc.terminate()
         proc.wait(timeout=10)

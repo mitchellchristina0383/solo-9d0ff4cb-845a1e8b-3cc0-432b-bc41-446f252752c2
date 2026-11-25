@@ -20,9 +20,12 @@ from werkzeug.utils import secure_filename
 from .storage import (
     MAX_IMAGE_SIZE,
     SECTOR_SIZE,
+    JobChangedError,
     JobExistsError,
     JobStorage,
+    SampleUnreadableError,
     StorageError,
+    VerificationBusyError,
 )
 
 
@@ -154,6 +157,29 @@ def create_app(data_dir: str | None = None) -> Flask:
         return Response(data, mimetype="application/octet-stream")
 
     # ---------------------------------------------------------------- #
+    # 用样盘核对已救扇区
+    # ---------------------------------------------------------------- #
+    @app.post("/api/verify")
+    def verify_sectors():
+        """用样盘核对核对开始时已救出的扇区，把读错内容的扇区退回缺失。
+
+        核对期间补读照常进行；样盘读不全或任务被替换时本轮作废、进度不变。
+        """
+        if not storage.has_job():
+            return _error(404, "尚无救援任务")
+        try:
+            result = storage.verify_saved_sectors()
+        except SampleUnreadableError as exc:
+            return _error(422, str(exc))
+        except JobChangedError as exc:
+            return _error(409, str(exc))
+        except VerificationBusyError as exc:
+            return _error(409, str(exc))
+        except StorageError as exc:
+            return _error(400, str(exc))
+        return jsonify({"ok": True, **result})
+
+    # ---------------------------------------------------------------- #
     # 同进度快照下载
     # ---------------------------------------------------------------- #
     @app.post("/api/snapshots")
@@ -166,13 +192,13 @@ def create_app(data_dir: str | None = None) -> Flask:
 
     @app.get("/api/snapshots/<snapshot_id>/image.bin")
     def download_image(snapshot_id: str):
+        meta = storage.snapshot_meta(snapshot_id)
         generator = storage.open_snapshot_image(snapshot_id)
-        if generator is None:
+        if generator is None or meta is None:
             abort(404, description="快照不存在或已过期")
-        state = storage.get_state()
         resp = Response(generator, mimetype="application/octet-stream")
         resp.headers["Content-Length"] = str(
-            state["sector_count"] * SECTOR_SIZE
+            meta["sector_count"] * SECTOR_SIZE
         )
         resp.headers["X-Snapshot-Id"] = snapshot_id
         resp.headers["Content-Disposition"] = (

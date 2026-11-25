@@ -4,14 +4,19 @@ import io
 import os
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 
 from rescue.storage import (
     MAX_IMAGE_SIZE,
     SECTOR_SIZE,
+    JobChangedError,
     JobExistsError,
     JobStorage,
+    SampleUnreadableError,
     StorageError,
+    VerificationBusyError,
 )
 
 
@@ -208,6 +213,249 @@ class SnapshotTests(StorageTestBase):
     def test_unknown_snapshot_404(self):
         self.assertIsNone(self.storage.open_snapshot_image("nope"))
         self.assertIsNone(self.storage.snapshot_missing_list("nope"))
+
+    def test_snapshot_survives_restart_and_keeps_original_bytes(self):
+        snap = self.storage.create_snapshot()
+        sid = snap["snapshot_id"]
+        original = b"".join(self.storage.open_snapshot_image(sid))
+
+        # 快照后把已救扇区改成别的字节，再“重启”
+        self.storage.save_sector(0, b"\xaa" * 512)  # 已存在 -> 不覆盖
+        reopened = JobStorage(self.tmp)
+        reopened.save_sector(6, b"\xbb" * 512)  # 新救出（旧快照应仍补零）
+
+        self.assertEqual(b"".join(reopened.open_snapshot_image(sid)), original)
+        listing = reopened.snapshot_missing_list(sid)
+        self.assertEqual(listing["missing"], [2, 5, 6])
+
+
+class VerifyTests(StorageTestBase):
+    """用样盘核对：退回读错的扇区、并发补读、样盘异常、任务被换。"""
+
+    def setUp(self):
+        super().setUp()
+        self.image = self.make_image(10)
+        self.storage.create_job(io.BytesIO(self.image))
+
+    def _write_sector_file(self, index: int, data: bytes) -> None:
+        path = os.path.join(
+            self.tmp, "sectors", f"{index % 1000:03d}", f"{index}.bin"
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+
+    def _save_good(self, indexes) -> None:
+        for i in indexes:
+            self.storage.save_sector(i, self.image[i * 512 : (i + 1) * 512])
+
+    def test_retracts_only_wrong_bytes_and_lists_them(self):
+        self._save_good((0, 2))
+        bad = b"\xde\xad" * 256
+        self.storage.save_sector(1, bad)
+        self.storage.save_sector(3, b"\x00" * 512)  # 真实全零，但与样盘不符
+
+        result = self.storage.verify_saved_sectors()
+        self.assertEqual(result["checked"], 4)
+        self.assertEqual(result["mismatched"], [1, 3])
+        self.assertEqual(result["retracted"], [1, 3])
+        self.assertEqual(result["kept_changed"], [])
+
+        state = self.storage.get_state()
+        self.assertEqual(state["saved"], [0, 2])
+        self.assertIn(1, state["missing"])
+        self.assertIn(3, state["missing"])
+
+    def test_correct_sector_kept_and_all_zero_sample_sector(self):
+        image = bytearray(self.image)
+        image[4 * 512 : 5 * 512] = b"\x00" * 512
+        storage = JobStorage(self.tmp + "-zero")
+        try:
+            storage.create_job(io.BytesIO(bytes(image)))
+            storage.save_sector(4, b"\x00" * 512)
+            result = storage.verify_saved_sectors()
+            self.assertEqual(result["retracted"], [])
+            self.assertNotIn(4, storage.get_state()["missing"])
+        finally:
+            shutil.rmtree(self.tmp + "-zero", ignore_errors=True)
+
+    def test_retraction_survives_restart_and_can_be_reread(self):
+        self._save_good((0,))
+        self.storage.save_sector(1, b"\x11" * 512)
+        self.storage.verify_saved_sectors()
+        self.assertEqual(self.storage.get_state()["missing"], list(range(1, 10)))
+
+        reopened = JobStorage(self.tmp)
+        self.assertIn(1, reopened.get_state()["missing"])
+        self.assertIsNone(reopened.read_saved_sector(1))
+
+        reopened.save_sector(1, self.image[512:1024])
+        self.assertNotIn(1, reopened.get_state()["missing"])
+        self.assertEqual(reopened.read_saved_sector(1), self.image[512:1024])
+
+    def test_reading_continues_during_verification(self):
+        self._save_good((0, 2))
+        self.storage.save_sector(1, b"\x22" * 512)
+
+        scan_started = threading.Event()
+        scan_go = threading.Event()
+        original = self.storage._sample_usable
+        original_scan = self.storage._scan_saved_vs_sample
+
+        def hooked_usable(size, sha):
+            original(size, sha)
+            scan_started.set()
+            self.assertTrue(scan_go.wait(10))
+
+        def hooked_scan(start_saved):
+            result = original_scan(start_saved)
+            scan_started.set()
+            self.assertTrue(scan_go.wait(10))
+            return result
+
+        self.storage._sample_usable = hooked_usable
+        self.storage._scan_saved_vs_sample = hooked_scan
+
+        outcome = {}
+
+        def run_verify():
+            outcome["result"] = self.storage.verify_saved_sectors()
+
+        worker = threading.Thread(target=run_verify)
+        worker.start()
+        self.assertTrue(scan_started.wait(10))
+
+        # 核对进行中，补读不受影响：新扇区立即可写入并出现在进度里
+        started = time.monotonic()
+        batch = self.storage.save_batch(
+            [(5, self.image[5 * 512 : 6 * 512])]
+        )
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(batch["saved_now"], [5])
+        self.assertIn(5, self.storage.get_state()["saved"])
+
+        scan_go.set()
+        worker.join(10)
+        self.assertFalse(worker.is_alive())
+
+        result = outcome["result"]
+        self.assertEqual(result["checked"], 3)  # 只核对核对开始时已救的 0,1,2
+        self.assertEqual(result["retracted"], [1])
+        self.assertIn(5, self.storage.get_state()["saved"])  # 核对后仍保留
+
+    def test_only_current_bad_bytes_are_retracted(self):
+        self._save_good((0, 2))
+        self.storage.save_sector(1, b"\x33" * 512)
+        self.storage.save_sector(3, b"\x44" * 512)
+
+        original_scan = self.storage._scan_saved_vs_sample
+
+        def hooked_scan(start_saved):
+            suspects = original_scan(start_saved)
+            # 模拟核对窗口内扇区 3 被并发写入了正确字节
+            self._write_sector_file(3, self.image[3 * 512 : 4 * 512])
+            return suspects
+
+        self.storage._scan_saved_vs_sample = hooked_scan
+        result = self.storage.verify_saved_sectors()
+        self.assertEqual(result["mismatched"], [1, 3])
+        self.assertEqual(result["retracted"], [1])
+        self.assertEqual(result["kept_changed"], [3])
+        self.assertEqual(self.storage.get_state()["saved"], [0, 2, 3])
+
+    def test_missing_sample_file_aborts_without_changes(self):
+        self._save_good((0,))
+        self.storage.save_sector(1, b"\x55" * 512)
+        before = self.storage.get_state()
+        os.unlink(os.path.join(self.tmp, "sample.img"))
+        with self.assertRaises(SampleUnreadableError):
+            self.storage.verify_saved_sectors()
+        self.assertEqual(self.storage.get_state(), before)
+        self.assertEqual(self.storage.read_saved_sector(1), b"\x55" * 512)
+
+    def test_truncated_sample_aborts_without_changes(self):
+        self._save_good((0,))
+        self.storage.save_sector(1, b"\x66" * 512)
+        before = self.storage.get_state()
+        sample_path = os.path.join(self.tmp, "sample.img")
+        with open(sample_path, "rb") as fh:
+            data = fh.read()
+        with open(sample_path, "wb") as fh:
+            fh.write(data[:-512])
+        with self.assertRaises(SampleUnreadableError):
+            self.storage.verify_saved_sectors()
+        self.assertEqual(self.storage.get_state(), before)
+
+    def test_replaced_sample_aborts_without_changes(self):
+        self._save_good((0,))
+        self.storage.save_sector(1, b"\x77" * 512)
+        before = self.storage.get_state()
+        sample_path = os.path.join(self.tmp, "sample.img")
+        with open(sample_path, "r+b") as fh:
+            fh.seek(0)
+            fh.write(b"\xff")
+        with self.assertRaises(SampleUnreadableError):
+            self.storage.verify_saved_sectors()
+        self.assertEqual(self.storage.get_state(), before)
+
+    def test_job_replaced_during_verification_discards_result(self):
+        self._save_good((0, 2))
+        self.storage.save_sector(1, b"\x88" * 512)
+        new_image = self.make_image(4)
+        original_scan = self.storage._scan_saved_vs_sample
+
+        def hooked_scan(start_saved):
+            result = original_scan(start_saved)
+            self.storage.reset()
+            self.storage.create_job(io.BytesIO(new_image))
+            return result
+
+        self.storage._scan_saved_vs_sample = hooked_scan
+        with self.assertRaises(JobChangedError):
+            self.storage.verify_saved_sectors()
+
+        # 新任务进度不受上一轮核对影响
+        state = self.storage.get_state()
+        self.assertEqual(state["sector_count"], 4)
+        self.assertEqual(state["saved"], [])
+        self.assertEqual(state["missing"], [0, 1, 2, 3])
+
+    def test_concurrent_verification_rejected(self):
+        self._save_good((0,))
+        self.storage._verify_gate.acquire()
+        try:
+            with self.assertRaises(VerificationBusyError):
+                self.storage.verify_saved_sectors()
+        finally:
+            self.storage._verify_gate.release()
+
+    def test_snapshot_before_retraction_keeps_old_bytes_and_list(self):
+        self._save_good((0, 2))
+        bad = b"\x99" * 512
+        self.storage.save_sector(1, bad)
+        sid = self.storage.create_snapshot()["snapshot_id"]
+        old_image = b"".join(self.storage.open_snapshot_image(sid))
+        self.assertEqual(old_image[512:1024], bad)  # 旧快照保留原（错误）字节
+        self.assertEqual(
+            self.storage.snapshot_missing_list(sid)["missing"],
+            [3, 4, 5, 6, 7, 8, 9],
+        )
+
+        self.storage.verify_saved_sectors()
+        # 旧快照仍可下载，内容与缺失清单固定
+        self.assertEqual(b"".join(self.storage.open_snapshot_image(sid)), old_image)
+        self.assertEqual(
+            self.storage.snapshot_missing_list(sid)["missing"],
+            [3, 4, 5, 6, 7, 8, 9],
+        )
+
+        sid2 = self.storage.create_snapshot()["snapshot_id"]
+        self.assertEqual(
+            self.storage.snapshot_missing_list(sid2)["missing"],
+            [1, 3, 4, 5, 6, 7, 8, 9],
+        )
+        new_image = b"".join(self.storage.open_snapshot_image(sid2))
+        self.assertEqual(new_image[512:1024], b"\x00" * 512)  # 退回后补零
 
 
 if __name__ == "__main__":

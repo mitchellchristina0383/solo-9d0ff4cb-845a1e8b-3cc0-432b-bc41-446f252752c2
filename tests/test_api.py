@@ -148,6 +148,77 @@ class ReportApiTests(ApiTestBase):
         self.assertEqual(resp.status_code, 404)
 
 
+class VerifyApiTests(ApiTestBase):
+    def setUp(self):
+        super().setUp()
+        self.upload()
+
+    def report_many(self, pairs):
+        entries = [
+            {"sector": i, "data": base64.b64encode(data).decode()}
+            for i, data in pairs
+        ]
+        return self.report(entries)
+
+    def test_verify_retracts_wrong_and_lists_ids(self):
+        good0 = self.image[0:512]
+        good2 = self.image[1024:1536]
+        bad1 = b"\x5a" * 512
+        self.report_many([(0, good0), (1, bad1), (2, good2)])
+
+        resp = self.client.post("/api/verify")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["checked"], 3)
+        self.assertEqual(body["mismatched"], [1])
+        self.assertEqual(body["retracted"], [1])
+        self.assertEqual(body["kept_changed"], [])
+        self.assertIn(1, body["progress"]["missing"])
+        self.assertEqual(self.client.get("/api/sectors/1").status_code, 409)
+        self.assertEqual(self.client.get("/api/sectors/0").data, good0)
+
+    def test_verify_without_job_404(self):
+        self.client.delete("/api/job")
+        self.assertEqual(self.client.post("/api/verify").status_code, 404)
+
+    def test_verify_missing_sample_422_and_progress_kept(self):
+        self.report_many([(0, b"\x01" * 512)])
+        before = self.client.get("/api/job").get_json()["progress"]
+        os.unlink(os.path.join(self.tmp, "sample.img"))
+        resp = self.client.post("/api/verify")
+        self.assertEqual(resp.status_code, 422)
+        self.assertFalse(resp.get_json()["ok"])
+        after = self.client.get("/api/job").get_json()["progress"]
+        self.assertEqual(before["saved"], after["saved"])
+        self.assertEqual(self.client.get("/api/sectors/0").data, b"\x01" * 512)
+
+    def test_verify_then_reread_reported(self):
+        self.report_many([(1, b"\x02" * 512)])
+        self.assertEqual(self.client.post("/api/verify").get_json()["retracted"], [1])
+        block = self.image[512:1024]
+        self.report_many([(1, block)])
+        self.assertNotIn(1, self.client.get("/api/missing").get_json()["missing"])
+        self.assertEqual(self.client.get("/api/sectors/1").data, block)
+
+    def test_verify_does_not_touch_sectors_saved_after_start(self):
+        # 核对开始时只有 0 已救；1 在核对期间才救出，即使内容有误也不在本轮范围
+        self.report_many([(0, self.image[0:512])])
+        original = self.app.extensions["rescue_storage"]._scan_saved_vs_sample
+        storage = self.app.extensions["rescue_storage"]
+
+        def hooked(start_saved):
+            result = original(start_saved)
+            storage.save_sector(1, b"\x03" * 512)
+            return result
+
+        storage._scan_saved_vs_sample = hooked
+        body = self.client.post("/api/verify").get_json()
+        self.assertEqual(body["checked"], 1)
+        self.assertEqual(body["retracted"], [])
+        self.assertIn(1, self.client.get("/api/job").get_json()["progress"]["saved"])
+
+
 class SnapshotApiTests(ApiTestBase):
     def setUp(self):
         super().setUp()
@@ -198,6 +269,48 @@ class SnapshotApiTests(ApiTestBase):
     def test_unknown_snapshot_404(self):
         self.assertEqual(self.client.get("/api/snapshots/nope/image.bin").status_code, 404)
         self.assertEqual(self.client.get("/api/snapshots/nope/missing.json").status_code, 404)
+
+    def test_snapshot_available_after_restart_and_retraction(self):
+        sid = self.client.post("/api/snapshots").get_json()["snapshot"]["snapshot_id"]
+        old_img = self.client.get(f"/api/snapshots/{sid}/image.bin").data
+        old_missing = self.client.get(
+            f"/api/snapshots/{sid}/missing.json"
+        ).get_json()["missing"]
+        self.assertEqual(old_missing, [2, 3, 5, 6, 8, 9])
+
+        # 把 0 号扇区改成错误内容，核对后退回缺失
+        storage = self.app.extensions["rescue_storage"]
+        storage.save_sector(0, b"\x00" * 512, persist=True)  # 已存在 -> 不覆盖
+        path = os.path.join(self.tmp, "sectors", "000", "0.bin")
+        with open(path, "wb") as fh:
+            fh.write(b"\xee" * 512)
+        storage._persist_state()
+        self.assertEqual(self.client.post("/api/verify").get_json()["retracted"], [0])
+
+        # 旧快照换一个进程重新打开（模拟重启）仍可下载原字节与旧缺失清单
+        from rescue.app import create_app
+
+        reopened = create_app(self.tmp)
+        reopened.testing = True
+        client2 = reopened.test_client()
+        img2 = client2.get(f"/api/snapshots/{sid}/image.bin").data
+        missing2 = client2.get(
+            f"/api/snapshots/{sid}/missing.json"
+        ).get_json()["missing"]
+        self.assertEqual(img2, old_img)
+        self.assertEqual(missing2, old_missing)
+
+        # 新快照按更新后的进度生成：0 号缺失并补零
+        sid2 = client2.post("/api/snapshots").get_json()["snapshot"]["snapshot_id"]
+        self.assertNotEqual(sid2, sid)
+        new_missing = client2.get(
+            f"/api/snapshots/{sid2}/missing.json"
+        ).get_json()["missing"]
+        self.assertIn(0, new_missing)
+        self.assertEqual(
+            client2.get(f"/api/snapshots/{sid2}/image.bin").data[:512],
+            b"\x00" * 512,
+        )
 
 
 if __name__ == "__main__":
